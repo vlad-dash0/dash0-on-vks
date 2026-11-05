@@ -1,0 +1,24 @@
+# VKS-like rehearsal cluster: 1 control plane + 2 workers, cluster-wide PSA "restricted".
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: vks-rehearsal
+nodes:
+- role: control-plane
+  extraMounts:
+  - hostPath: ./psa-config.yaml
+    containerPath: /etc/kubernetes/psa/psa-config.yaml
+    readOnly: true
+  kubeadmConfigPatches:
+  - |
+    kind: ClusterConfiguration
+    apiServer:
+      extraArgs:
+        admission-control-config-file: /etc/kubernetes/psa/psa-config.yaml
+      extraVolumes:
+      - name: psa
+        hostPath: /etc/kubernetes/psa
+        mountPath: /etc/kubernetes/psa
+        readOnly: true
+        pathType: Directory
+- role: worker
+- role: worker

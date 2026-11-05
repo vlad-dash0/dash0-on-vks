@@ -1,0 +1,116 @@
+# Demo workloads in a namespace that stays on the cluster default (PSA "restricted").
+# Node frontend -> Node backend (distributed trace), Python loadgen (urllib client spans),
+# backend exposes Prometheus metrics via scrape annotations.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: demo-code, namespace: demo}
+data:
+  backend.js: |
+    const http = require('http');
+    let hits = 0;
+    http.createServer((req, res) => {
+      if (req.url === '/metrics') {
+        res.setHeader('Content-Type', 'text/plain; version=0.0.4');
+        return res.end(`# HELP demo_backend_hits_total Requests served\n# TYPE demo_backend_hits_total counter\ndemo_backend_hits_total ${hits}\n`);
+      }
+      hits++;
+      console.log(JSON.stringify({level: 'info', msg: 'backend served', path: req.url, hits}));
+      res.end(JSON.stringify({ok: true, hits}));
+    }).listen(8080);
+  frontend.js: |
+    const http = require('http');
+    http.createServer((req, res) => {
+      http.get('http://backend.demo.svc.cluster.local:8080/work', (r) => {
+        let body = ''; r.on('data', (c) => body += c);
+        r.on('end', () => { console.log(JSON.stringify({level: 'info', msg: 'frontend proxied', body})); res.end(body); });
+      }).on('error', (e) => { console.error(JSON.stringify({level: 'error', msg: e.message})); res.statusCode = 502; res.end(); });
+    }).listen(8080);
+  loadgen.py: |
+    import time, urllib.request
+    from opentelemetry import trace  # provided by the operator's auto-instrumentation
+    tracer = trace.get_tracer('loadgen')
+    while True:
+        # A named root span, so Dash0 shows "send request" instead of "Unknown operation".
+        with tracer.start_as_current_span('send request'):
+            try:
+                urllib.request.urlopen('http://frontend.demo.svc.cluster.local:8080/', timeout=5).read()
+                print('loadgen ok', flush=True)
+            except Exception as e:
+                print(f'loadgen error {e}', flush=True)
+        time.sleep(2)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: backend, namespace: demo}
+spec:
+  selector: {matchLabels: {app: backend}}
+  template:
+    metadata:
+      labels: {app: backend, app.kubernetes.io/name: backend, app.kubernetes.io/part-of: demo}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 1000, seccompProfile: {type: RuntimeDefault}}
+      containers:
+      - name: app
+        image: node:22-alpine
+        command: [node, /code/backend.js]
+        ports: [{containerPort: 8080}]
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+        volumeMounts: [{name: code, mountPath: /code}]
+        resources: {limits: {memory: 256Mi}}
+      volumes: [{name: code, configMap: {name: demo-code}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: frontend, namespace: demo}
+spec:
+  selector: {matchLabels: {app: frontend}}
+  template:
+    metadata: {labels: {app: frontend, app.kubernetes.io/name: frontend, app.kubernetes.io/part-of: demo}}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 1000, seccompProfile: {type: RuntimeDefault}}
+      containers:
+      - name: app
+        image: node:22-alpine
+        command: [node, /code/frontend.js]
+        ports: [{containerPort: 8080}]
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+        volumeMounts: [{name: code, mountPath: /code}]
+        resources: {limits: {memory: 256Mi}}
+      volumes: [{name: code, configMap: {name: demo-code}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: loadgen, namespace: demo}
+spec:
+  selector: {matchLabels: {app: loadgen}}
+  template:
+    metadata: {labels: {app: loadgen, app.kubernetes.io/name: loadgen, app.kubernetes.io/part-of: demo}}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 1000, seccompProfile: {type: RuntimeDefault}}
+      containers:
+      - name: app
+        image: python:3.12-slim
+        command: [python, -u, /code/loadgen.py]
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+        volumeMounts: [{name: code, mountPath: /code}]
+        resources: {limits: {memory: 256Mi}}
+      volumes: [{name: code, configMap: {name: demo-code}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: backend, namespace: demo}
+spec: {selector: {app: backend}, ports: [{port: 8080}]}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: frontend, namespace: demo}
+spec: {selector: {app: frontend}, ports: [{port: 8080}]}
